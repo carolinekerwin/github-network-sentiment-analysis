@@ -1,2 +1,6 @@
 # github-network-sentiment-analysis
 An analysis of the connection between sentiment and productivity in open source Github repositories
+
+Project Abstract:
+
+Employees' engagement at work is not only important for their personal satisfaction with their jobs but can lead to successful business outcomes as well. With the rise of remote work and virtual collaboration tools, there are more opportunities than ever for organizations to leverage data to understand their employees' collaboration behaviors and what makes a successful team. This study uses collaboration data on open source repositories from Github to understand the connection between the sentiment of a team's collaboration activities, the patterns of the activities themselves, and productivity outcomes for the teams involved. I examine the correlation between a repository's productivity and two separate attributes of their collaboration: the amount of their content that is positive and the extent to which they exhibit an attribute of signed social networks called structural balance. Findings suggest that users within most repositories exhibit structurally balanced interactions. More positive content in collaboration is associated with higher productivity and more structural balance in communication, when it includes both positive and negative sentiment, is associated with lower productivity.
