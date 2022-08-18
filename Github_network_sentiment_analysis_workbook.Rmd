@@ -1,0 +1,738 @@
+---
+title: "Capstone Analysis"
+author: "Caroline Kerwin"
+date: "18 August 2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(corrplot)
+library(devtools)
+library(data.table)
+library(lubridate)
+library(RSenti4SD)
+library(igraph)
+library(signnet)
+library(Matrix)
+library(ggraph)
+
+options(scipen=999)
+```
+
+## Bigquery data results
+Query: 
+
+```{r}
+# Load and clean data
+df <- read.csv("bq-results-20220816-175333-1660672444321.csv")
+print(paste("Number of rows:", nrow(df)))
+df$created_at <- ymd_hms(df$created_at)
+# Rename field names to conventions
+
+
+# Drop any rows that do not have a head_repo_id value because there are data errors in these rows and their
+# repository cannot be defined
+print(paste(nrow(df %>% filter(is.na(head_repo_id))),
+      "blank head_repo_ids identified and removed"))
+df <- df %>% filter(!is.na(head_repo_id))
+```
+
+```{r}
+# Get data by repo
+count_of_comments <- df %>% count(head_repo_id, sort = TRUE)
+# Identify repos with at least 10 comments
+over_10_comments <- count_of_comments %>% filter(n >= 10)
+data_at_least_10 <- df %>% filter(head_repo_id %in% over_10_comments$head_repo_id)
+
+# Identify repos with at least 3 users
+# Filter down to only repos that have 3+ contributors -- enough for a triad to form
+users_by_repo <- data_at_least_10 %>% group_by(head_repo_id) %>% summarize(n_distinct(user_id))
+over_3_contributors <- users_by_repo[users_by_repo$`n_distinct(user_id)` >= 3,]
+data <- data_at_least_10 %>% filter(data_at_least_10$head_repo_id %in% over_3_contributors$head_repo_id)
+data$repo_pull_request_id <- paste0(data$head_repo_id, "_", data$pull_request_id)
+print(paste("Number of comment actions after filtering:", nrow(data)))
+print(paste("Number of repositories after filtering:", length(unique(data$head_repo_id))))
+
+# Dataset is too large to do efficient sentiment analysis - use approach outlined in research proposal to create stratified random sample
+# Calculate work events per person
+actions_per_commit <- data %>% group_by(head_repo_id) %>% count(commit_id)
+actions_per_repo <- actions_per_commit %>% count(head_repo_id)
+actions_per_repo <- actions_per_repo %>% rename(count_work_events = "n")
+users_repo <- data %>% group_by(head_repo_id) %>% summarize(repo_users = n_distinct(user_id))
+work_events_data <- users_repo %>% inner_join(actions_per_repo)
+work_events_data$work_per_person <- work_events_data$count_work_events / work_events_data$repo_users
+work_events_data$productivity <- log(work_events_data$work_per_person)
+
+# Remove data for datapoints where only one user committed to a pull request (no collaboration data)
+users_by_repo_pr <- data %>% group_by(repo_pull_request_id) %>% summarize(users_in_pr = n_distinct(user_id))
+prs_3_plus_users <- users_by_repo_pr %>% filter(users_in_pr >= 3)
+data_multi_users <- data %>% filter(data$repo_pull_request_id %in% prs_3_plus_users$repo_pull_request_id)
+print(paste("Number of comment actions after filteringto 3+ user PRs:", nrow(data_multi_users)))
+# Should be same as above
+print(paste("Number of repositories after filtering to 3+ user PRs:", length(unique(data_multi_users$head_repo_id))))
+
+# Assign quartiles to repos
+work_events_data <- work_events_data %>% mutate(productivity_quartile = ntile(productivity, 4))
+
+# Get stratified sample of productivity using 4000 repos
+work_events_relevant_data <- work_events_data %>% filter(head_repo_id %in% data_multi_users$head_repo_id)
+set.seed(5)
+stratified_repos <- work_events_relevant_data %>%
+  group_by(productivity_quartile) %>%
+  sample_n(size = 1000)
+```
+
+```{r}
+# Filter overall dataframe to stratified random sample of repositories
+data_multi_sample <- data_multi_users %>% filter(head_repo_id %in% stratified_repos$head_repo_id)
+
+write.csv(data_multi_sample, "data_multi_sample.csv")
+```
+
+
+```{r, eval=FALSE}
+# DownloadSenti4SD()
+# model <- Senti4SDModel()
+# 
+# # Run Senti4SD Classifier
+# data_multi_sample_results <- Senti4SD(data_multi_sample$commit_comment_body, model)
+# data_multi_sample$results <- data_multi_sample_results$polarity
+# data_multi_sample %>% count(results)
+# write.csv(data_multi_sample, "data_multi_sample_senti_results.csv")
+```
+
+```{r}
+# Load in classified data
+data_senti <- read.csv("data_multi_sample_senti_results.csv") %>% subset(select = -c(X, ...1))
+data_senti$created_at <- ymd_hms(data_senti$created_at)
+data_senti_wide <- data_senti %>% group_by(head_repo_id) %>% count(results) %>%
+  pivot_wider(names_from = results, values_from = n)
+
+# R will default to autopopulating repos with zero positive/negative comments (i.e. entirely
+# neutral) as NAs -- change this to zeros
+data_senti_wide[is.na(data_senti_wide)] = 0
+
+# Get proportions of positive and negative content
+data_senti_pos_or_neg_all <- data_senti_wide 
+data_senti_pos_or_neg_all$positive_n <- data_senti_pos_or_neg_all$positive + data_senti_pos_or_neg_all$neutral
+
+data_senti_pos_or_neg_all <- data_senti_pos_or_neg_all %>% subset(
+  select = -c(neutral, positive))
+data_senti_pos_or_neg_all$total <- data_senti_pos_or_neg_all$negative + data_senti_pos_or_neg_all$positive_n
+data_senti_pos_or_neg_all <- data_senti_pos_or_neg_all %>% rename(positive = positive_n)
+data_senti_pos_or_neg_all$percent_positive <- data_senti_pos_or_neg_all$positive /
+  data_senti_pos_or_neg_all$total
+data_senti_pos_or_neg_all$percent_negative <- data_senti_pos_or_neg_all$negative /
+  data_senti_pos_or_neg_all$total
+data_senti_pos_or_neg <- data_senti_pos_or_neg_all
+
+print(head(data_senti_pos_or_neg))
+```
+
+```{r}
+# Plot: proportions of comment polarity in  repos
+data_senti_res_long <- data_senti %>% group_by(head_repo_id) %>% count(results) 
+data_senti_pos_or_neg_all_order <- data_senti_pos_or_neg_all[,c(1,6)] %>% arrange(desc(percent_negative))
+data_senti_pos_or_neg_all_order$order <- 1:nrow(data_senti_pos_or_neg_all_order)
+
+data_senti_res_long$neg_order <- sapply(X = data_senti_res_long$head_repo_id,
+        FUN = function(repo_id) as.double(
+        data_senti_pos_or_neg_all_order[data_senti_pos_or_neg_all_order$head_repo_id == repo_id,3]))
+
+ggplot(data_senti_res_long, aes(fill = results, y = n, x = neg_order)) +
+  geom_bar(position = "fill", stat = "identity") +
+  labs(title = "Stacked Bar Chart: Proportion of Commit Comments by Polarity",
+       subtitle = paste("Ordered by Most -> Least Negative, n=", length(unique(data_senti_res_long$head_repo_id)),
+                        "repositories"),
+       x = "Repositories (each vertical line represents one repository)",
+       y = "Proportion of content") +
+  scale_fill_discrete(name = "Sentiment") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) 
+```
+
+```{r}
+# Check for distribution in variables of interest
+# Percent positive
+ggplot(data_senti_pos_or_neg, aes(x = percent_positive)) +
+  geom_histogram() +
+  geom_vline(aes(xintercept = mean(percent_positive)),
+            color="blue", linetype="dashed", size=1)
+
+# Confirm findings with a Shapiro-Wilk test
+# Write a function to check for normality and print results
+shapiro_wilk_test <- function(column){
+  # Runs a Shapiro-Wilk test and notifies the user of whether the null hypothesis
+  # rejected (data not normally distributed) or not (data normally distributed) at the 0.05 level. 
+  result <- shapiro.test(column)
+  print(result)
+  if(result$p.value >= 0.5){
+    print("We fail to reject the null hypothesis. The data appear to be normally distributed.")
+  }
+  else{
+    print("We reject the null hypothesis. The data do not appear to be normally distributed.")
+  }
+}
+
+shapiro_wilk_test(data_senti_pos_or_neg$percent_positive)
+```
+
+## Network Analysis
+
+#### Functions to Run Analysis
+
+```{r}
+# Assign signs by mode of communication sentiment
+# Define a function that calculates the mode (excluding zeros)
+# If multiple values appear the mode number of times, takes the first
+find_mode <- function(x) {
+  u <- unique(x) 
+  u <- u[!u == 0]
+  tab <- tabulate(match(x, u))
+  
+  if(length(u[tab == max(tab)]) == 2){
+    return(u[tab == max(tab)][1])
+  }
+  else{
+    return(u[tab == max(tab)])
+  }
+}
+
+get_edges <- function(dataset, repo_id){
+  # Given a repo ID, returns a dataframe of edges in a bipartite graph with the 
+  # first column as users and the second column the PRs to which they contributed
+  # Dataset here is a df containing data on multiple repos
+  ordered_n <- dataset %>% filter(head_repo_id == repo_id) %>% arrange(repo_pull_request_id)
+  edges <- ordered_n$user_id %>% as.data.frame() %>% rename(user_id = ".")
+  # Sometimes, PRs and users have the same ID number -- eliminate this issue by adding "u_" to users
+  edges$user_id <- paste0("u_", edges$user_id)
+  edges$repo_pull_request_id <- ordered_n$repo_pull_request_id
+  
+  return(edges)
+}
+
+get_commit_sentiment <- function(dataset, repo_id){
+  # Given a repo_id, returns a vector of the sentiment of each commit comment in the repo
+  # Can be combined with get_edges to get the necessary ingredients for signed bipartite
+   ordered_n <- dataset %>% filter(head_repo_id == repo_id) %>% arrange(repo_pull_request_id, results)
+   results_char <- ordered_n$results %>% as.character()
+   results_sign <- replace(results_char, results_char == "negative", -1)
+   results_sign <- replace(results_sign, results_sign == "neutral", 1)
+   results_sign <- replace(results_sign, results_sign == "positive", 1)
+   results_sign <- as.numeric(results_sign)
+
+   return(results_sign)
+}
+
+construct_signed_bipartite <- function(edges, signs){
+  # Given an edge list (in dataframe format) and a numeric vector of signs,
+  # returns a signed bipartite graph
+  g <- graph_from_data_frame(edges, directed = FALSE)
+  V(g)$type <- V(g)$name %in% edges$user_id
+  E(g)$sign <- signs
+  return(g)  
+}
+
+get_signed_digraph <- function(bi_graph){
+  # Takes signed bipartite and returns a signed directed graph with edges representing mutual collaboration
+  # activities and the sign of edges representing the predominant sentiment a user expressed in mutual PRs
+  # Get user-to-user edge list for bipartite in dataframe format:
+  edgelist_df <- do.call(
+    rbind,
+    lapply(
+      Filter(
+        # Get data by pull request
+        function(x) nrow(x) > 1,
+        split(get.data.frame(bi_graph), ~to)
+      ),
+      # Link users in each pull request to one another
+      function(d) {
+        with(
+          d,
+          cbind(data.frame(
+          # Add edges in one direction
+          rbind(t(combn(d$from, 2)),
+          # Add edges in other direction
+          t(combn(d$from, 2))[,2:1]),
+          # Assign PR data to all edges
+            pr = unique(d$to)
+            )
+          )
+        )
+      }
+    )
+  )
+  edgelist_df <- edgelist_df %>% rename(c(from = "X1", to = "X2"))
+  bi_df <- get.data.frame(bi_graph)
+  # Assign each user -> PR pair a sign based off of the bipartite graph
+  sign_by_user <- rep(0, nrow(edgelist_df))
+  for(edge in 1:nrow(edgelist_df)){
+    sign_by_user[edge] <- find_mode(bi_df$sign[bi_df$from == edgelist_df$from[edge] 
+                                     & bi_df$to == edgelist_df$pr[edge]])
+  }
+  edgelist_df$sign <- sign_by_user
+  # For users that have multiple edges (worked on multiple pull requests together), get the most common sign
+  mode_sign_df <- edgelist_df %>% group_by(from, to) %>% mutate(mode_sign = find_mode(sign)) 
+  edgelist_unique <- mode_sign_df %>% select(-c(pr, sign)) %>% unique()
+  # Set labels for making into graph edge attributes
+  edgelist_unique <- edgelist_unique %>% rename(sign = "mode_sign")
+  edgelist_unique$color <- ifelse(edgelist_unique$sign == -1, "pink", "blue")
+  
+  # Remove self-loop edges since we are focused on collaboration across users
+  proj_user_digraph <- simplify(graph_from_data_frame(edgelist_unique, directed = TRUE),
+                                 remove.multiple = FALSE, remove.loops = TRUE)
+  return(proj_user_digraph)
+}
+
+make_flat_signed_proj <- function(dataset, repo_id){
+  edges <- get_edges(dataset, repo_id)
+  signs <- get_commit_sentiment(dataset, repo_id)
+  g <- construct_signed_bipartite(edges, signs)
+  multi_proj <- get_signed_digraph(g)
+  
+  # Sign of edge will either be -1 or 1; preference for keeping -1
+  projection <- as.undirected(multi_proj, mode = "collapse",
+                              edge.attr.comb = list(sign = "min", "ignore"))
+  return(projection)
+}
+
+get_user_senti_balance <- function(projection){
+   if(length(E(projection)) > 0){
+    
+    balance <- balance_score(projection)
+    if(is.nan(balance)){
+      result <- "NA - no triangles"
+    }
+    else{
+    result <- balance
+    }
+  }
+  else{
+   result <- "NA - no mutual contributions"
+  }
+  return(result)
+}
+```
+
+
+```{r}
+# Run analysis
+repos_list <- unique(data_senti$head_repo_id)
+
+# Performing the following calculation generates warnings that are duplicative
+# of printed messages -- suppress them:
+oldw <- getOption("warn")
+options(warn = -1)
+
+repo_network_list <- vector(mode = "list", length = length(repos_list))
+repo_balance_scores_u <- rep(0, length(repos_list))
+counter <- 1
+
+for(repo in repos_list){
+  # Get balance score for each repository
+  g <- make_flat_signed_proj(data_senti, repo)
+  repo_network_list[[counter]] <- g  
+  repo_balance_scores_u[counter] <- get_user_senti_balance(g)
+  counter <- counter + 1
+}
+
+names(repo_network_list) <- repos_list
+options(warn = oldw)
+```
+
+
+```{r}
+# These values should all be zero as isolates and dyads not connected to other users were filtered
+# out in the data collection process
+user_senti_balance_analysis <- repos_list %>% cbind(repo_balance_scores_u)
+user_senti_balance_analysis <- user_senti_balance_analysis %>% as.data.frame()
+colnames(user_senti_balance_analysis) <- c("repo", "repo_balance_score")
+
+# Is there sufficient heterogeneity in this dataset for analysis?
+user_senti_balance_analysis %>% count(repo_balance_score)
+
+# Number of repositories with no mutual contributions:
+no_mutual_contributions <- user_senti_balance_analysis %>% 
+  filter(repo_balance_score == "NA - no mutual contributions") %>% 
+  count()
+print(no_mutual_contributions[1,])
+
+# Percentage of repositories with no mutual contributions:
+print(no_mutual_contributions[1,] / nrow(user_senti_balance_analysis))
+
+# Number of repositories with no triangles:
+no_triangles <- user_senti_balance_analysis %>% 
+  filter(repo_balance_score == "NA - no triangles") %>% 
+  count()
+print(no_triangles[1,])
+
+# Percentage of repositories with no mutual contributions:
+print(no_triangles[1,] / nrow(user_senti_balance_analysis))
+
+# Plot a histogram of balance scores, excluding repos for which this calculation isn't possible
+user_senti_balance_analysis_no_na <- user_senti_balance_analysis %>% 
+  filter(!repo_balance_score %in% c("NA - no mutual contributions", "NA - no triangles"))
+
+ggplot(user_senti_balance_analysis_no_na, aes(x = as.numeric(repo_balance_score))) +
+  geom_histogram() +
+  labs(title = "Histogram of Structural Balance Scores",
+       subtitle = "Sign = user sentiment in pull request; flattened biasing negative")
+```
+
+```{r}
+# Let us examine further the data on repositories that are perfectly structurally balanced
+balanced <- user_senti_balance_analysis_no_na[user_senti_balance_analysis_no_na$repo_balance_score == 1,]
+balanced_repos <- balanced[,1]
+# Index only repos that are perfectly balanced
+balanced_networks <- repo_network_list[c(as.character(balanced_repos))]
+
+get_positivity_percentage <- function(network){
+  edge_signs <- E(network)$sign
+  return(sum(edge_signs == 1)/ length(edge_signs))
+}
+
+balanced_positivity_percent <- sapply(balanced_networks, get_positivity_percentage)
+balanced$edge_percent_positive <- balanced_positivity_percent
+
+ggplot(balanced, aes(x = as.numeric(edge_percent_positive))) +
+  geom_histogram() +
+  labs(title = "Histogram of Percent of Positive Edges out of Total Edges",
+       subtitle = "For perfectly structurally balanced repositories") +
+  theme_minimal()
+```
+
+A challenge with this analysis is that the vast majority of repositories have a balance score of one.The hypothesis about high structural balance having an adverse effect on collaboration is due to the divisive nature of structurally balanced groups, but this is only the case when there is diverse sentiment. In a perfectly structurally balanced network that is entirely positive, the opposing group is empty. From this description, one would not anticipate adverse effects on collaboration. 
+
+In these analyses, we will first look at all repositories to get an overarching view of the sample. We will then remove repositories that have a structural balance score of one due to homogeneous positivity and see if the hypothesis holds true when assuming that there is some level of negativity in the repository.
+
+```{r}
+# Get data on which repositories are fully positive for future analysis
+balanced_all_pos <- balanced[balanced$edge_percent_positive >= 1,]
+balanced_all_pos$repo <- as.numeric(balanced_all_pos$repo)
+
+# Add in edge positivity data for fully positive networks
+data_senti_pos_or_neg <- data_senti_pos_or_neg %>% full_join(
+  select(balanced_all_pos,repo, edge_percent_positive), by = c("head_repo_id" = "repo"))
+head(data_senti_pos_or_neg)
+data_senti_pos_or_neg <- data_senti_pos_or_neg %>% rename(fully_pos_or_not = "edge_percent_positive")
+
+# Populate type
+data_senti_pos_or_neg$fully_pos_or_not[is.na(data_senti_pos_or_neg$fully_pos_or_not)] = 0
+
+# Add contributor data
+data_senti_pos_or_neg <- data_senti_pos_or_neg %>% inner_join(y = work_events_data, by = "head_repo_id")
+data_senti_pos_or_neg <- data_senti_pos_or_neg %>% rename(total_contributors = "repo_users")
+
+# Change type of head_repo_id to numeric to align with joining dataframe
+user_senti_balance_analysis_no_na$repo <- as.numeric(user_senti_balance_analysis_no_na$repo)
+
+senti_count_work_events <- data_senti_pos_or_neg %>% subset(select = c(
+  head_repo_id, count_work_events, fully_pos_or_not, total_contributors, productivity)) %>%
+  inner_join(y = user_senti_balance_analysis_no_na, by = c("head_repo_id" = "repo"))
+senti_count_work_events$repo_balance_score <- as.numeric(senti_count_work_events$repo_balance_score)
+
+# Assemble other data for behavioral analysis
+# Percent positivity for each repo
+# repo_network_list does not have the same order as senti_count_work_events, so data needs to be shuffled
+get_positivity_percentage_repo <- function(repo_id){
+  network_idx <- repo_network_list[as.character(repo_id)]
+  network <- network_idx[1][[1]]
+  edge_signs <- E(network)$sign
+  return(sum(edge_signs == 1)/ length(edge_signs))
+}
+senti_count_work_events$positivity_score <-  sapply(senti_count_work_events$head_repo_id,
+                                                    get_positivity_percentage_repo)
+
+```
+
+```{r}
+# Create dataset looking exclusively at repositories that are not exclusively positive in communication
+data_senti_work_balance_no_full_pos <- senti_count_work_events[
+  senti_count_work_events$fully_pos_or_not != 1,]
+
+# Get count of people actually working together in these repositories and not just working on their own
+get_vertex_count <- function(repo_id){
+  network_idx <- repo_network_list[as.character(repo_id)]
+  network <- network_idx[1][[1]]
+  count_vertices <- length(V(network))
+  return(count_vertices)
+}
+senti_count_work_events$count_mutual_collaborators <- sapply(senti_count_work_events$head_repo_id, get_vertex_count)
+head(senti_count_work_events)
+```
+
+
+
+## Research Questions:
+
+#### Do repositories exhibit heterogeneous structrual balance?
+Many of the perfectly structurally balanced repositories are such because they are entirely positive in their communications. However, some of the perfectly structurally balanced repositories have some heteorgeneity in sentiment. To what extent is this because the edges in triangles are all positive? Does structural balance in triangles within a repo exist in any form other than total positivity?
+
+```{r}
+# How many repos are perfectly structurally balanced?
+balanced_count <- length(repo_balance_scores_u[repo_balance_scores_u >= .99999])
+print(paste("Number of perfectly balanced repositories:", balanced_count))
+print(paste("Percentage of repos that are perfectly balanced:", 
+            balanced_count / length(repo_balance_scores_u)))
+```
+
+```{r}
+triangle_df <- data.frame(matrix(ncol = 5, nrow = 0))
+triangle_headings <- c("repo", "+++", "++-", "+--", "---")
+colnames(triangle_df) <- triangle_headings
+
+get_triangles_repo <- function(repo_id){
+  network_idx <- repo_network_list[as.character(repo_id)]
+  network <- network_idx[1][[1]]
+  return(count_signed_triangles(network))
+}
+
+triangle_list <- lapply(senti_count_work_events$head_repo_id, get_triangles_repo)
+
+counter <- 1
+for(repo in triangle_list){
+  triangle_df[counter, 1] <- senti_count_work_events$head_repo_id[counter]
+  triangle_df[counter, 2] <- triangle_list[[counter]][1][[1]] 
+  triangle_df[counter, 3] <- triangle_list[[counter]][2][[1]] 
+  triangle_df[counter, 4] <- triangle_list[[counter]][3][[1]] 
+  triangle_df[counter, 5] <- triangle_list[[counter]][4][[1]] 
+  counter <- counter + 1
+}
+
+triangle_df$repo <- as.factor(triangle_df$repo)
+triangle_df <- triangle_df %>% rowwise() %>% 
+  dplyr::mutate(all_positive_percent = `+++` / sum(`+++`, `++-`, `+--`, `---`))
+triangle_df_order <- triangle_df %>% arrange(desc(all_positive_percent))
+triangle_df_order$order <- 1:nrow(triangle_df_order)
+
+triangle_df_long <- triangle_df %>% pivot_longer(names_to = "signs", cols = c(`+++`, `++-`, `+--`, `---`))
+triangle_df_long$pos_order <- sapply(X = triangle_df_long$repo,
+        FUN = function(repo_id) as.double(
+        triangle_df_order[triangle_df_order$repo == repo_id,7]))
+
+# Accounting for the possibility of imprecision in float arithmetic
+all_positive_count <- nrow(triangle_df %>% filter(all_positive_percent >= .9999))
+repo_count <- nrow(triangle_df)
+print("Total structurally balanced repositories with all triangles +++")
+print(all_positive_count)
+print("Percent of total repos studied that only have positive triads:")
+print(all_positive_count / repo_count)
+at_least_half_pos_count <-  nrow(triangle_df %>% filter(all_positive_percent > .5))
+print("Total structurally balanced repositories with more than half of triangles +++")
+print(at_least_half_pos_count)
+print("Percent of total repos studied that have at least half positive triads:")
+print(at_least_half_pos_count / repo_count)
+
+
+ggplot(triangle_df_long, aes(fill = signs, y = value, x = pos_order)) +
+  geom_bar(position = "fill", stat = "identity") +
+  scale_fill_brewer() +
+  labs(title = "Stacked Bar Chart: Proportion Signed Triangles by Sign per Repository",
+       subtitle = "Ordered by Most -> Least Universally Positive",
+       x = "Repositories (each vertical line represents one repository)",
+       y = "Proportion of Triangles of Each Sign") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+
+total_all_plus <- sum(triangle_df$`+++`)
+total_one_neg <- sum(triangle_df$`++-`)
+total_two_neg <- sum(triangle_df$`+--`)
+total_all_neg <- sum(triangle_df$`---`)
+total_triads <- total_all_plus + total_one_neg + total_two_neg + total_all_neg
+
+print(paste("+++ total:", total_all_plus, "Percent of triads:", (total_all_plus / total_triads)))
+print(paste("++- total:", total_one_neg, "Percent of triads:", (total_one_neg / total_triads)))
+print(paste("+-- total:", total_two_neg, "Percent of triads:", (total_two_neg / total_triads)))
+print(paste("--- total:", total_all_neg, "Percent of triads:", (total_all_neg / total_triads)))
+```
+```{r}
+# Perfectly structurally balanced and had heterogeneity:
+print(paste("Perfectly structurally balanced and had heterogeneity:",
+            balanced_count - all_positive_count))
+print(paste("Percentage of Perfectly structurally balanced and had heterogeneity out of balanced:",
+            (balanced_count - all_positive_count) / balanced_count))
+print(paste("Percentage of Perfectly structurally balanced and had heterogeneity out of all repos:",
+            (balanced_count - all_positive_count) / repo_count))
+```
+
+
+```{r}
+# Descriptive network statistics: find largest cliques
+get_cliques_repo <- function(repo_id){
+  network_idx <- repo_network_list[as.character(repo_id)]
+  network <- network_idx[1][[1]]
+  return(clique_num(network))
+}
+
+largest_clique_list <- sapply(senti_count_work_events$head_repo_id, get_cliques_repo)
+hist(largest_clique_list)
+
+ggplot() +
+  aes(x = largest_clique_list) +
+  geom_histogram(binwidth = 1, color = "white", fill = "cornflowerblue") +
+  labs(fill = "",
+       title = "Histogram of Max Clique Size",
+       subtitle = paste("n =",
+                        length(largest_clique_list), "repositories"),
+       x = "Size of largest clique in graph",
+       y = "Frequency") +
+  theme_minimal()
+
+clique_table <- table(largest_clique_list) %>% as.data.frame()
+print(clique_table)
+clique_deciles <- largest_clique_list %>% as.data.frame() %>% mutate(decile = ntile(largest_clique_list, 10))
+clique_deciles <- clique_deciles %>% group_by(decile) %>% summarize(max_cliques_in_decile = max(.))
+print(clique_deciles)
+```
+
+Ensuring we are focusing on instances of 3+ collaborators, do we observe structural balance?
+
+```{r}
+triangle_df$max_clique_size <- largest_clique_list
+triangle_df$structural_balance_score <- senti_count_work_events$repo_balance_score
+
+# Look exclusively at repos that have a max clique size of 4+
+cliques_over_3 <- triangle_df %>% filter(max_clique_size >= 4)
+# Total number of repos with largest clique 4+:
+count_cliques_over_3 <- nrow(cliques_over_3)
+print(count_cliques_over_3)
+
+# Percent of large-clique repos with perfect structural balance:
+cliques_over_3_balanced <- cliques_over_3 %>% filter(structural_balance_score >= .99999)
+count_cliques_over_3_balanced <- nrow(cliques_over_3_balanced)
+print(count_cliques_over_3_balanced)
+print(count_cliques_over_3_balanced / count_cliques_over_3)
+# Percent of large_clique repos with perfect structural balance AND some non-positive triangles
+cliques_over_3_balanced_neg <- cliques_over_3_balanced %>% filter(all_positive_percent < 1)
+count_cliques_over_3_balanced_neg <- nrow(cliques_over_3_balanced_neg)
+print(count_cliques_over_3_balanced_neg)
+print(count_cliques_over_3_balanced_neg / count_cliques_over_3_balanced)
+```
+
+
+
+
+#### Do repositories with a lower structural balance have better collaboration?
+
+
+```{r}
+# Flag repos that have no negative edges in triads
+all_pos_tri_df <- triangle_df[triangle_df$all_positive_percent >= .9999,]
+all_pos_tri_repos <-all_pos_tri_df$repo
+senti_work_events_no_full_pos_tri <- senti_count_work_events %>% filter(
+  !head_repo_id %in% all_pos_tri_repos)
+
+# Positive triad repos removed
+ggplot(senti_work_events_no_full_pos_tri, aes(
+  x = repo_balance_score, y = productivity, size = total_contributors)) +
+  geom_point(stat = "identity", color = "#356cdb", alpha = 0.3) +
+  scale_size(range = c(.01, 10), name = "Number of Contributors") +
+  labs(title = "Productivity vs Balance Scores",
+       subtitle = paste("Size of point indicates relative number of contributors to repo, n=",
+                        nrow(senti_work_events_no_full_pos_tri), "repositories"),
+       x = "Structural Balance Score (out of 1)",
+       y = "Productivity (log work events per person)") +
+  theme_minimal()
+
+# Determine if parametric or non-parametric correlation should be used- structural balance:
+shapiro.test(senti_work_events_no_full_pos_tri$repo_balance_score)
+# Outcome variable:
+shapiro.test(senti_count_work_events$productivity)
+shapiro.test(senti_work_events_no_full_pos_tri$productivity)
+# We reject the null hypothesis -> data are not normally distributed -> non-parametric!
+
+# Check for correlations between repo_balance_score and success measures
+cor.test(senti_work_events_no_full_pos_tri$repo_balance_score, senti_work_events_no_full_pos_tri$productivity, method = "kendall")
+
+print(paste("Number of repositories analysed:", nrow(senti_work_events_no_full_pos_tri)))
+print(paste("Number of analysed repositories that are perfectly structurally balanced:",
+            nrow(senti_work_events_no_full_pos_tri[
+              senti_work_events_no_full_pos_tri$repo_balance_score == 1,])))
+nrow(senti_work_events_no_full_pos_tri)
+```
+
+
+#### Does the amount of team collaboration that is positive influence the productivity of a repository?
+
+```{r}
+# Positivity and productivity
+ggplot(senti_count_work_events, aes(
+  x = positivity_score, y = productivity, size = total_contributors)) +
+  geom_point(stat = "identity", color = "#4a3396", alpha = 0.3) +
+  scale_size(range = c(.01, 10), name = "Number of Contributors") +
+  labs(title = "Productivity vs Percent of Interactions that are Positive",
+       subtitle = paste("Size of point indicates relative number of contributors to repo, n =",
+       nrow(senti_count_work_events), "repositories"),
+       x = "Positivity Percentage (out of 1)",
+       y = "Productivity (log work events per person)") +
+  theme_minimal()
+
+# Determine if parametric or non-parametric correlation should be used- positivity:
+shapiro.test(senti_count_work_events$positivity_score)
+# We reject the null hypothesis -> data are not normally distributed -> non-parametric!
+
+# Check for correlations between repo_balance_score and success measures
+cor.test(senti_count_work_events$positivity_score, senti_count_work_events$productivity, method = "kendall")
+
+# repos analysed:
+nrow(senti_count_work_events)
+```
+
+
+#### Can we use characteristics about collaboration within a repo to predict productivity?
+
+```{r}
+# Before beginning the linear regression, check to see that basic assumptions are met
+# Since this analysis looks at structural balance alongside positivity, we want to look at
+# only structurally balanced repos that are NOT entirely positive, as this is the hypothesis that
+# the study is designed to test regarding structural balance
+corrplot(cor(senti_work_events_no_full_pos_tri), method = "number")
+```
+
+
+```{r}
+attach(senti_work_events_no_full_pos_tri)
+
+# Add more network attributes? store and study other network attributes somehow?
+mod <- lm(productivity
+          ~ total_contributors + positivity_score + repo_balance_score)
+summary(mod)
+
+# Plot residuals and QQ plot to check for any concerns with heteroskedasticity
+mod_res <- resid(mod)
+plot(fitted(mod), mod_res)
+abline(0,0)
+
+qqnorm(mod_res)
+qqline(mod_res)
+```
+
+If we focus exclusively on not only the number of people working on a repository but the number of people working together on a repository (removing individuals who did not have mutual contributions with anyone), how does this affect results? 
+
+```{r}
+mod_collaborators <- lm(productivity
+          ~ count_mutual_collaborators + positivity_score + repo_balance_score)
+summary(mod_collaborators)
+
+# Plot residuals and QQ plot to check for any concerns with heteroskedasticity
+mod_collaborators_res <- resid(mod_collaborators)
+plot(fitted(mod_collaborators), mod_collaborators_res)
+abline(0,0)
+
+qqnorm(mod_collaborators_res)
+qqline(mod_collaborators_res)
+
+detach(senti_work_events_no_full_pos_tri)
+```
+
+
+
+
+
